@@ -2,9 +2,11 @@
 import asyncio
 import html
 import io
+import ipaddress
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -26,7 +28,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-SHORT_HOSTS = {"amzn.to", "amzn.in", "amzn.eu", "amzn.asia", "a.co", "link.amazon", "amzn-to.co", "amzlink.to"}
+SHORT_HOSTS = {"amzn.to", "amzn.in", "amzn.eu", "amzn.asia", "a.co", "link.amazon", "amzn-to.co", "amzlink.to", "amazn.lt"}
 SHORT_HOSTS |= {h.strip().lower() for h in os.getenv("EXTRA_SHORT_HOSTS", "").split(",") if h.strip()}
 # short links written without a scheme, e.g. "link.amazon/B07o4k6Hr"
 SHORT_BARE_RE = re.compile(
@@ -35,8 +37,22 @@ SHORT_BARE_RE = re.compile(
 AMAZON_HOST_RE = re.compile(
     r"^(?:www\.|m\.|smile\.)?amazon\.(?:com|[a-z]{2}|co\.[a-z]{2}|com\.[a-z]{2})$"
 )
-ASIN_RE = re.compile(r"/(?:dp|gp/product|gp/aw/d|product|exec/obidos/ASIN)/([A-Za-z0-9]{10})(?:[/?#]|$)")
+ASIN_RE = re.compile(
+    r"/(?:dp|gp/product|gp/aw/d|gp/offer-listing|gp/aw/ol|product|product-reviews|exec/obidos/ASIN)/([A-Za-z0-9]{10})(?:[/?#]|$)"
+)
+# Links to these never lead to Amazon -> not worth a redirect lookup. Every OTHER host is resolved,
+# so any third-party shortener (bit.ly, cutt.ly, amazn.lt, ...) that lands on Amazon is supported.
+NON_AMAZON_DOMAINS = {
+    "t.me", "telegram.me", "telegram.org", "telegra.ph", "youtube.com", "youtu.be", "instagram.com",
+    "facebook.com", "fb.com", "fb.me", "twitter.com", "x.com", "whatsapp.com", "wa.me", "linkedin.com",
+    "flipkart.com", "fkrt.it", "fkrt.cc", "fkrt.site", "myntra.com", "ajio.com", "meesho.com",
+    "snapdeal.com", "nykaa.com", "jiomart.com", "tatacliq.com", "croma.com", "reliancedigital.in",
+    "paytm.com", "google.com", "goo.gl", "play.google.com", "apple.com", "wikipedia.org",
+}
+MAX_RESOLVE_PER_POST = 12
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+# amazon.in paths that are redirectors (no ASIN in the URL itself) -> must be followed
+NEEDS_FOLLOW_RE = re.compile(r"^/(?:d/|l/|gp/r\.html|gp/redirect\.html|gp/slredirect/|gp/f\.html)", re.I)
 DROP_PARAMS = {"tag", "linkcode", "linkid", "ascsubtag", "creative", "creativeasin", "camp", "th", "psc", "_encoding"}
 
 ID_RE = re.compile(r"^-?\d{5,20}$")
@@ -114,9 +130,25 @@ def host_of(url: str) -> str:
     return (urlsplit(url).hostname or "").lower()
 
 
-def is_amazon_candidate(url: str) -> bool:
+def _safe_host(host: str) -> bool:
+    """Never fetch internal/private targets (SSRF guard)."""
+    if not host or host == "localhost" or host.endswith((".local", ".internal", ".localhost")):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
+    except ValueError:
+        return True
+
+
+def should_try(url: str) -> bool:
+    """Any http(s) link might be an Amazon shortener, so try everything except known non-Amazon sites."""
     h = host_of(url)
-    return h in SHORT_HOSTS or bool(AMAZON_HOST_RE.match(h))
+    if not h or not _safe_host(h):
+        return False
+    if h in SHORT_HOSTS or AMAZON_HOST_RE.match(h):
+        return True
+    return not any(h == d or h.endswith("." + d) for d in NON_AMAZON_DOMAINS)
 
 
 # ----------------------------------------------------------- per-deal context
@@ -162,21 +194,25 @@ _REDIRECT_PATS = (
 )
 
 
-def _find_redirect(body: str, base: str) -> Optional[str]:
+def _find_redirect(body: str, base: str, allow_scan: bool = True) -> Optional[str]:
     """Some shorteners answer 200 with an HTML/JS redirect instead of a 30x."""
-    for pat in _REDIRECT_PATS:
+    # last pattern = "any Amazon URL in the page": only safe on Amazon-ish shortener hosts
+    for pat in (_REDIRECT_PATS if allow_scan else _REDIRECT_PATS[:-1]):
         m = re.search(pat, body, re.I)
         if m:
             return urljoin(base, html.unescape(m.group(1)).replace("\\/", "/"))
     return None
 
 
-async def resolve_final(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """Follow short-link redirects (30x, meta-refresh or JS) until we land on a real Amazon host,
-    without downloading the Amazon page itself."""
+async def _resolve_uncached(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    """Follow redirects (30x, meta-refresh or JS) until we land on a real Amazon page URL,
+    without downloading the Amazon page itself. Works for any shortener."""
     cur, status = url, None
     for _ in range(8):
-        if AMAZON_HOST_RE.match(host_of(cur)):
+        host = host_of(cur)
+        if not _safe_host(host):  # SSRF guard on every hop
+            break
+        if AMAZON_HOST_RE.match(host) and not NEEDS_FOLLOW_RE.match(urlsplit(cur).path):
             return cur
         try:
             async with session.get(
@@ -189,7 +225,10 @@ async def resolve_final(session: aiohttp.ClientSession, url: str) -> Optional[st
                     continue
                 if status == 200:
                     body = (await r.content.read(300_000)).decode("utf-8", "ignore")
-                    nxt = _find_redirect(body, cur)
+                    # "any Amazon URL in the page" scan only on Amazon-ish shortener hosts
+                    nxt = _find_redirect(
+                        body, cur, allow_scan=host in SHORT_HOSTS or "amz" in host or "amazon" in host
+                    )
                     if nxt and nxt != cur:
                         cur = nxt
                         continue
@@ -197,8 +236,25 @@ async def resolve_final(session: aiohttp.ClientSession, url: str) -> Optional[st
             log.warning("resolve failed for %s: %s", url, e)
             return None
         break
-    log.warning("could not resolve %s (last status %s, last url %s)", url, status, cur)
+    (log.warning if host_of(url) in SHORT_HOSTS else log.info)(
+        "not an Amazon link / unresolved: %s (last status %s, last url %s)", url, status, cur
+    )
     return None
+
+
+_RESOLVE_CACHE: dict = {}  # url -> (final|None, expires_at)
+
+
+async def resolve_final(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    now = time.monotonic()
+    hit = _RESOLVE_CACHE.get(url)
+    if hit and hit[1] > now:
+        return hit[0]
+    final = await _resolve_uncached(session, url)
+    if len(_RESOLVE_CACHE) > 1000:
+        _RESOLVE_CACHE.pop(next(iter(_RESOLVE_CACHE)))
+    _RESOLVE_CACHE[url] = (final, now + (6 * 3600 if final else 300))  # failures retried after 5 min
+    return final
 
 
 def build_affiliate(final: str, tag: str):
@@ -206,8 +262,9 @@ def build_affiliate(final: str, tag: str):
     p = urlsplit(final)
     host = "www." + re.sub(r"^(www|m|smile)\.", "", (p.hostname or "").lower())
     m = ASIN_RE.search(p.path)
-    if m:
-        asin = m.group(1).upper()
+    qasin = next((v for k, v in parse_qsl(p.query) if k.lower() in ("asin", "pd_rd_i") and re.fullmatch(r"[A-Za-z0-9]{10}", v)), None)
+    if m or qasin:
+        asin = (m.group(1) if m else qasin).upper()
         return asin, f"https://{host}/dp/{asin}?tag={tag}", f"https://{host}/dp/{asin}"
     q = [
         (k, v)
@@ -221,14 +278,13 @@ def build_affiliate(final: str, tag: str):
 
 
 async def build_deals(session, s: str, links: list, tag: str) -> list:
-    cand = [i for i, l in enumerate(links) if is_amazon_candidate(l.url)]
+    cand = [i for i, l in enumerate(links) if should_try(l.url)][:MAX_RESOLVE_PER_POST]
     if not cand:
         return []
     finals = await asyncio.gather(*(resolve_final(session, links[i].url) for i in cand))
     deals, seen = [], set()
     for i, final in zip(cand, finals):
         if not final:
-            log.warning("Skipping unresolved link: %s", links[i].url)
             continue
         asin, aff, page = build_affiliate(final, tag)
         key = asin or aff
