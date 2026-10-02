@@ -367,6 +367,16 @@ async def main():
     await S.client.get_dialogs()  # warm the entity cache (needed for private channels by ID)
     await refresh_dest()
 
+    for raw in re.split(r"[,\s]+", os.getenv("SOURCE_CHANNEL", "")):  # optional env-seeded source(s)
+        if not raw or S.db.has_source(U.marked_ids(raw) if U.ID_RE.match(raw) else []):
+            continue
+        ent = await resolve_chat(raw)
+        if isinstance(ent, (Channel, Chat)):
+            await S.db.add_source(tl_utils.get_peer_id(ent), tl_utils.get_display_name(ent) or raw, S.me.id)
+            log.info("Seeded source from env: %s", raw)
+        else:
+            log.warning("SOURCE_CHANNEL %s could not be resolved (is the account a member?)", raw)
+
     if BOT_TOKEN:
         S.bot = TelegramClient(StringSession(), API_ID, API_HASH, flood_sleep_threshold=60)
         S.bot.parse_mode = "html"
