@@ -16,7 +16,9 @@ import aiohttp
 from telethon import Button, TelegramClient, events, utils as tl_utils
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.types import Channel, Chat, InputPeerChannel, InputPeerChat
+from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.types import (BotCommand, BotCommandScopeDefault, Channel, Chat,
+                               InputPeerChannel, InputPeerChat)
 
 import utils as U
 from database import Database
@@ -104,74 +106,115 @@ async def refresh_dest():
 
 # ------------------------------------------------------------- admin commands
 HELP = (
-    "🤖 <b>Commands</b>\n\n"
-    "• Channel/group ID bhejo (bina command) → source add\n"
-    "• <code>/del_source &lt;channel_id&gt;</code>\n"
-    "• <code>/status</code>\n"
-    "• <code>/set_header &lt;text&gt;</code> (<code>off</code> = hata do)\n"
-    "• <code>/set_footer &lt;text&gt;</code> (<code>off</code> = hata do)\n"
-    "• <code>/set_tag &lt;tag&gt;</code>\n"
-    "• <code>/set_dest &lt;id | @username&gt;</code>"
+    "<b>📖 Command Guide</b>\n\n"
+    "<b>Sources</b>\n"
+    "• Channel/group ID bhejein (bina command) — source add\n"
+    "• <code>/del_source &lt;channel_id&gt;</code> — source hatayein\n"
+    "• <code>/status</code> — active sources aur destination\n\n"
+    "<b>Post Settings</b>\n"
+    "• <code>/set_header &lt;text&gt;</code> — header (<code>off</code> = hatayein)\n"
+    "• <code>/set_footer &lt;text&gt;</code> — footer (<code>off</code> = hatayein)\n"
+    "• <code>/set_tag &lt;tag&gt;</code> — Amazon affiliate tag\n"
+    "• <code>/set_dest &lt;id | @username&gt;</code> — destination channel"
 )
+
+DENIED = "🔒 <b>Access Restricted</b>\n\nYeh bot private hai aur sirf authorised admins ke liye hai."
+
+MENU = [
+    ("start", "Bot start karein"),
+    ("help", "Saare commands dekhein"),
+    ("status", "Active sources aur destination"),
+    ("set_header", "Post header set karein"),
+    ("set_footer", "Post footer set karein"),
+    ("set_tag", "Affiliate tag set karein"),
+    ("set_dest", "Destination channel set karein"),
+    ("del_source", "Source delete karein"),
+]
 
 
 async def add_source(event, raw: str):
     db = S.db
     if U.ID_RE.match(raw):
-        dup = db.has_source(U.marked_ids(raw))
-        if dup is not None:
+        if db.has_source(U.marked_ids(raw)) is not None:
             return await event.reply("⚠️ Yeh channel/group already saved hai.")
     ent = await resolve_chat(raw)
     if not isinstance(ent, (Channel, Chat)):
         return await event.reply(
-            "❌ Yeh ID/username valid nahi hai, ya account us channel/group ka member nahi hai."
+            "❌ <b>Source add nahi hua</b>\n\n"
+            "ID/username valid nahi hai, ya account is channel/group ka member nahi hai."
         )
     if getattr(ent, "left", False):
         if getattr(ent, "username", None):
             try:
                 await S.client(JoinChannelRequest(ent))
             except Exception as e:
-                return await event.reply(f"❌ Channel join nahi ho paya: {esc(e)}")
+                return await event.reply(f"❌ <b>Channel join nahi ho paya</b>\n\n{esc(e)}")
         else:
-            return await event.reply("❌ Account is private channel ka member nahi hai. Pehle join karo.")
+            return await event.reply(
+                "❌ <b>Source add nahi hua</b>\n\nAccount is private channel ka member nahi hai. Pehle join karein."
+            )
     cid = tl_utils.get_peer_id(ent)
     title = tl_utils.get_display_name(ent) or str(cid)
     if not await db.add_source(cid, title, event.sender_id):
         return await event.reply("⚠️ Yeh channel/group already saved hai.")
     await event.reply(
-        f"✅ <b>Source add ho gaya!</b>\n\n📌 {esc(title)}\n🆔 <code>{cid}</code>\n\n"
-        "Ab se is source ko turant monitor kiya jayega."
+        "✅ <b>Source Added</b>\n\n"
+        f"📌 <b>Name:</b> {esc(title)}\n🆔 <b>ID:</b> <code>{cid}</code>\n\n"
+        "Monitoring turant shuru ho gayi hai."
     )
+
+
+async def cmd_start(event, arg):
+    sender = await event.get_sender()
+    name = esc(getattr(sender, "first_name", None) or "Admin")
+    await event.reply(
+        f"👋 <b>Namaste, {name}!</b>\n\n"
+        "<b>Amazon Deals Automation</b> mein aapka swagat hai. Yeh system aapke source channels se "
+        "Amazon deals uthakar affiliate link ke saath destination channel par post karta hai.\n\n"
+        "🚀 <b>Quick Setup</b>\n"
+        "1️⃣ <code>/set_tag</code> — affiliate tag\n"
+        "2️⃣ <code>/set_dest</code> — destination channel\n"
+        "3️⃣ Source channel ki ID bhejein\n\n"
+        "Saare commands ke liye /help dekhein."
+    )
+
+
+async def cmd_help(event, arg):
+    await event.reply(HELP)
 
 
 async def cmd_del_source(event, arg):
     if not U.ID_RE.match(arg):
-        return await event.reply("Usage: <code>/del_source &lt;channel_id&gt;</code>")
+        return await event.reply(
+            "ℹ️ <b>Usage</b>\n<code>/del_source &lt;channel_id&gt;</code>\n\n"
+            "Source ki ID /status mein dekh sakte hain."
+        )
     rows = await S.db.remove_source(U.marked_ids(arg))
     if not rows:
         return await event.reply("⚠️ Yeh source already deleted hai ya list me nahi hai.")
     cid, title = rows[0]
     await event.reply(
-        f"🗑️ <b>Source delete ho gaya.</b>\n\n📌 {esc(title)}\n🆔 <code>{cid}</code>\n\n"
+        "🗑️ <b>Source Removed</b>\n\n"
+        f"📌 <b>Name:</b> {esc(title)}\n🆔 <b>ID:</b> <code>{cid}</code>\n\n"
         "Ab is source se posts forward nahi hongi."
     )
 
 
 async def cmd_status(event, arg):
     src = S.db.sources
-    lines = [f"📡 <b>Active Sources</b> ({len(src)})"]
+    lines = [f"📡 <b>Active Sources</b> ({len(src)})\n"]
     if src:
         for n, (cid, title) in enumerate(sorted(src.items(), key=lambda x: str(x[1]).lower()), 1):
-            lines.append(f"{n}. {esc(title)} — <code>{cid}</code>")
+            lines.append(f"{n}. {esc(title)}\n    🆔 <code>{cid}</code>")
     else:
-        lines.append("— koi source add nahi hai —")
-    lines.append("\n📢 <b>Destination</b>")
+        lines.append("Abhi koi source add nahi hai. Channel ki ID bhejkar add karein.")
+    lines.append("\n📢 <b>Destination Channel</b>\n")
     dest = S.dest or await refresh_dest()
     if dest:
-        uname = f" (@{dest.username})" if getattr(dest, "username", None) else ""
-        lines.append(f"{esc(tl_utils.get_display_name(dest))}{uname} — <code>{S.dest_id}</code>")
+        uname = f"\n    🔗 @{dest.username}" if getattr(dest, "username", None) else ""
+        lines.append(f"{esc(tl_utils.get_display_name(dest))}{uname}\n    🆔 <code>{S.dest_id}</code>")
     else:
-        lines.append("⚠️ Set nahi hai. <code>/set_dest &lt;id&gt;</code> use karo.")
+        lines.append("⚠️ Set nahi hai. <code>/set_dest &lt;id&gt;</code> use karein.")
     await event.reply("\n".join(lines))
 
 
@@ -180,14 +223,15 @@ def _text_setter(field: str, label: str):
         cur = S.db.settings.get(field)
         if not arg:
             return await event.reply(
-                f"Current {label}: {esc(cur) if cur else '— not set —'}\n"
-                f"Usage: <code>/set_{label} &lt;text&gt;</code> ya <code>/set_{label} off</code>"
+                f"📝 <b>{label.capitalize()}</b>\n\n"
+                f"<b>Current:</b> {esc(cur) if cur else '— set nahi hai —'}\n\n"
+                f"<b>Usage</b>\n<code>/set_{label} &lt;text&gt;</code>\n<code>/set_{label} off</code> — hatane ke liye"
             )
         if arg.lower() in ("off", "none", "clear"):
             await S.db.set_field(field, None)
-            return await event.reply(f"🧹 {label.capitalize()} hata diya gaya.")
+            return await event.reply(f"🧹 <b>{label.capitalize()} Removed</b>\n\nAb posts mein {label} nahi judega.")
         await S.db.set_field(field, arg)
-        await event.reply(f"✅ {label.capitalize()} update ho gaya:\n\n{esc(arg)}")
+        await event.reply(f"✅ <b>{label.capitalize()} Updated</b>\n\n{esc(arg)}")
 
     return handler
 
@@ -195,44 +239,45 @@ def _text_setter(field: str, label: str):
 async def cmd_set_tag(event, arg):
     arg = arg.strip().lstrip("?").removeprefix("tag=")
     if not re.fullmatch(r"[A-Za-z0-9_-]{3,40}", arg):
-        return await event.reply("Usage: <code>/set_tag yourtag-21</code>")
+        return await event.reply(
+            "ℹ️ <b>Usage</b>\n<code>/set_tag yourtag-21</code>\n\nTag mein sirf letters, numbers, <code>-</code> aur <code>_</code> allowed hain."
+        )
     await S.db.set_field("affiliate_tag", arg)
-    await event.reply(f"✅ Affiliate tag set: <code>{esc(arg)}</code>")
+    await event.reply(f"✅ <b>Affiliate Tag Updated</b>\n\n🏷️ <code>{esc(arg)}</code>")
 
 
 async def cmd_set_dest(event, arg):
     ent = await resolve_chat(arg, bare_ok=True) if arg else None
     if not isinstance(ent, (Channel, Chat)):
         return await event.reply(
-            "❌ Destination resolve nahi hua. Usage: <code>/set_dest &lt;id | @username&gt;</code>\n"
-            "(Account ka member/admin hona zaroori hai.)"
+            "❌ <b>Destination set nahi hua</b>\n\n"
+            "<b>Usage:</b> <code>/set_dest &lt;id | @username&gt;</code>\n"
+            "Account us channel ka member ho, aur posting bot channel mein admin ho."
         )
     await S.db.set_field("destination_channel", str(tl_utils.get_peer_id(ent)))
     await refresh_dest()
     await event.reply(
-        f"✅ Destination set: {esc(tl_utils.get_display_name(ent))} — <code>{S.dest_id}</code>"
+        "✅ <b>Destination Updated</b>\n\n"
+        f"📢 <b>Name:</b> {esc(tl_utils.get_display_name(ent))}\n🆔 <b>ID:</b> <code>{S.dest_id}</code>"
     )
 
 
-async def cmd_help(event, arg):
-    await event.reply(HELP)
-
-
 COMMANDS = {
+    "/start": cmd_start,
+    "/help": cmd_help,
     "/del_source": cmd_del_source,
     "/status": cmd_status,
     "/set_header": _text_setter("header_text", "header"),
     "/set_footer": _text_setter("footer_text", "footer"),
     "/set_tag": cmd_set_tag,
     "/set_dest": cmd_set_dest,
-    "/help": cmd_help,
-    "/start": cmd_help,
 }
 
 
 async def handle_admin(event):
     if event.sender_id not in S.db.admins:  # strict admin check (defence in depth)
         return
+    via_bot = S.bot is not None and event.client is S.bot
     text = (event.raw_text or "").strip()
     if not text:
         return
@@ -242,10 +287,28 @@ async def handle_admin(event):
         arg = parts[1].strip() if len(parts) > 1 else ""
         handler = COMMANDS.get(cmd)
         if handler:
-            await handler(event, arg)
+            return await handler(event, arg)
+        if via_bot:
+            await event.reply("❓ <b>Unknown command</b>\n\nSaare commands ke liye /help dekhein.")
         return
     if U.ID_RE.match(text) or U.USERNAME_RE.match(text):  # direct ID -> add source
-        await add_source(event, text)
+        return await add_source(event, text)
+    if via_bot:
+        await event.reply(
+            "ℹ️ Source add karne ke liye valid channel/group ID bhejein "
+            "(jaise <code>-1001234567890</code>), ya /help dekhein."
+        )
+
+
+async def on_bot_message(event):
+    try:
+        if not event.is_private:
+            return
+        if event.sender_id not in S.db.admins:
+            return await event.reply(DENIED)
+        await handle_admin(event)
+    except Exception:
+        log.exception("bot handler error")
 
 
 # ------------------------------------------------------------ deal processing
@@ -382,6 +445,14 @@ async def main():
         S.bot.parse_mode = "html"
         await S.bot.start(bot_token=BOT_TOKEN)
         log.info("Posting via bot @%s", (await S.bot.get_me()).username)
+        S.bot.add_event_handler(on_bot_message, events.NewMessage(incoming=True))
+        try:  # bot menu (the "/" command list)
+            await S.bot(SetBotCommandsRequest(
+                scope=BotCommandScopeDefault(), lang_code="",
+                commands=[BotCommand(command=c, description=d) for c, d in MENU],
+            ))
+        except Exception as e:
+            log.warning("could not set bot menu: %s", e)
     S.client.add_event_handler(on_message, events.NewMessage())
     log.info("Userbot up as %s | admins=%s | sources=%d | destination=%s",
              S.me.id, sorted(S.db.admins), len(S.db.sources), S.dest_id)
