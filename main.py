@@ -5,6 +5,7 @@ Make session:   python main.py --login      (run locally, copy the printed STRIN
 """
 import asyncio
 import html
+import io
 import logging
 import os
 import re
@@ -12,10 +13,10 @@ import sys
 from typing import Optional
 
 import aiohttp
-from telethon import TelegramClient, events, utils as tl_utils
+from telethon import Button, TelegramClient, events, utils as tl_utils
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import Channel, Chat, InputPeerChannel, InputPeerChat
 
 import utils as U
 from database import Database
@@ -28,6 +29,7 @@ API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("STRING_SESSION", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # optional: if set, this bot posts to the destination
 ENV_ADMINS = [int(x) for x in re.split(r"[,\s]+", os.getenv("ADMIN_IDS", "")) if x.lstrip("-").isdigit()]
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 # Multi-deal posts: reuse the source image on every deal? (default: no -> per-product Amazon image)
@@ -36,7 +38,9 @@ CAPTION_LIMIT = 1024
 
 
 class State:
-    client: TelegramClient = None
+    client: TelegramClient = None   # userbot: reads sources + takes admin commands
+    bot: TelegramClient = None      # bot (optional): posts deals to destination
+    bot_target = None
     db: Database = None
     http: aiohttp.ClientSession = None
     me = None
@@ -89,6 +93,12 @@ async def refresh_dest():
         log.error("Destination %r could not be resolved (is the account a member?)", ref)
         return None
     S.dest, S.dest_id = ent, tl_utils.get_peer_id(ent)
+    if getattr(ent, "username", None):
+        S.bot_target = ent.username
+    elif isinstance(ent, Channel):
+        S.bot_target = InputPeerChannel(ent.id, 0)  # bots may address channels they admin with hash 0
+    else:
+        S.bot_target = InputPeerChat(ent.id)
     return ent
 
 
@@ -246,9 +256,20 @@ def has_sendable_media(msg) -> bool:
     return bool(doc and not msg.sticker and (doc.mime_type or "").startswith(("image/", "video/")))
 
 
+async def source_media_file(msg):
+    """Bots can't reuse the userbot's file reference -> download, then re-upload."""
+    data = await S.client.download_media(msg, file=bytes)
+    bio = io.BytesIO(data)
+    bio.name = "media" + (msg.file.ext if msg.file and msg.file.ext else ".jpg")
+    return bio
+
+
 async def post_deal(msg, deal: U.Deal, use_source_media: bool):
     cfg = S.db.settings
     meta = None
+    sender = S.bot or S.client
+    target = S.bot_target if S.bot else S.dest
+    buttons = [Button.url("🛒 Check Price", deal.url)] if S.bot else None
 
     async def get_meta():
         nonlocal meta
@@ -257,11 +278,13 @@ async def post_deal(msg, deal: U.Deal, use_source_media: bool):
         return meta
 
     title = deal.title or (await get_meta())["title"] or "Amazon Deal"
-    text = U.format_post(title, deal.url, cfg.get("header_text"), cfg.get("footer_text"), CAPTION_LIMIT - 24)
+    text = U.format_post(title, deal.url, cfg.get("header_text"), cfg.get("footer_text"),
+                         CAPTION_LIMIT - 24, link_line=not S.bot)
 
     if use_source_media:
         try:
-            await S.client.send_file(S.dest, msg.media, caption=text)
+            media = await source_media_file(msg) if S.bot else msg.media
+            await sender.send_file(target, media, caption=text, buttons=buttons, supports_streaming=True)
             return
         except Exception as e:
             log.warning("source media send failed, falling back to Amazon image: %s", e)
@@ -269,11 +292,11 @@ async def post_deal(msg, deal: U.Deal, use_source_media: bool):
     image = await U.download_image(S.http, (await get_meta())["image"])
     if image:
         try:
-            await S.client.send_file(S.dest, image, caption=text)
+            await sender.send_file(target, image, caption=text, buttons=buttons)
             return
         except Exception as e:
             log.warning("image send failed, falling back to text: %s", e)
-    await S.client.send_message(S.dest, text, link_preview=False)
+    await sender.send_message(target, text, buttons=buttons, link_preview=False)
 
 
 async def handle_source(event):
@@ -344,6 +367,11 @@ async def main():
     await S.client.get_dialogs()  # warm the entity cache (needed for private channels by ID)
     await refresh_dest()
 
+    if BOT_TOKEN:
+        S.bot = TelegramClient(StringSession(), API_ID, API_HASH, flood_sleep_threshold=60)
+        S.bot.parse_mode = "html"
+        await S.bot.start(bot_token=BOT_TOKEN)
+        log.info("Posting via bot @%s", (await S.bot.get_me()).username)
     S.client.add_event_handler(on_message, events.NewMessage())
     log.info("Userbot up as %s | admins=%s | sources=%d | destination=%s",
              S.me.id, sorted(S.db.admins), len(S.db.sources), S.dest_id)
@@ -352,6 +380,8 @@ async def main():
     try:
         await S.client.run_until_disconnected()
     finally:
+        if S.bot:
+            await S.bot.disconnect()
         await S.http.close()
         await S.db.close()
 
