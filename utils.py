@@ -3,6 +3,7 @@ import asyncio
 import html
 import io
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -25,7 +26,12 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-SHORT_HOSTS = {"amzn.to", "amzn.in", "amzn.eu", "amzn.asia", "a.co"}
+SHORT_HOSTS = {"amzn.to", "amzn.in", "amzn.eu", "amzn.asia", "a.co", "link.amazon", "amzn-to.co", "amzlink.to"}
+SHORT_HOSTS |= {h.strip().lower() for h in os.getenv("EXTRA_SHORT_HOSTS", "").split(",") if h.strip()}
+# short links written without a scheme, e.g. "link.amazon/B07o4k6Hr"
+SHORT_BARE_RE = re.compile(
+    r"(?<![\w@./-])((?:" + "|".join(re.escape(h) for h in sorted(SHORT_HOSTS)) + r")/[^\s<>\"']+)", re.I
+)
 AMAZON_HOST_RE = re.compile(
     r"^(?:www\.|m\.|smile\.)?amazon\.(?:com|[a-z]{2}|co\.[a-z]{2}|com\.[a-z]{2})$"
 )
@@ -97,6 +103,9 @@ def parse_links(message):
     for m in URL_RE.finditer(s):  # fallback for URLs without entities
         if not any(l.start < m.end() and m.start() < l.end for l in links):
             links.append(Link(_norm_url(m.group(0)), m.start(), m.end()))
+    for m in SHORT_BARE_RE.finditer(s):
+        if not any(l.start < m.end() and m.start() < l.end for l in links):
+            links.append(Link(_norm_url(m.group(1)), m.start(1), m.end(1)))
     links.sort(key=lambda l: l.start)
     return s, links
 
@@ -145,10 +154,27 @@ def snippet_for(s: str, links: list, i: int) -> str:
 
 
 # ------------------------------------------------------- affiliate conversion
+_REDIRECT_PATS = (
+    r'http-equiv=["\']?refresh["\']?[^>]*?content=["\'][^"\']*?url=([^"\'>\s]+)',
+    r'location\.replace\(\s*["\']([^"\']+)',
+    r'(?:window\.|document\.)?location(?:\.href)?\s*=\s*["\']([^"\']+)',
+    r'(https?://(?:www\.|m\.|smile\.)?amazon\.[a-z.]{2,6}/[^\s"\'<>\\]+)',
+)
+
+
+def _find_redirect(body: str, base: str) -> Optional[str]:
+    """Some shorteners answer 200 with an HTML/JS redirect instead of a 30x."""
+    for pat in _REDIRECT_PATS:
+        m = re.search(pat, body, re.I)
+        if m:
+            return urljoin(base, html.unescape(m.group(1)).replace("\\/", "/"))
+    return None
+
+
 async def resolve_final(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """Follow short-link redirects manually until we land on a real Amazon host
-    (without downloading the Amazon page itself)."""
-    cur = url
+    """Follow short-link redirects (30x, meta-refresh or JS) until we land on a real Amazon host,
+    without downloading the Amazon page itself."""
+    cur, status = url, None
     for _ in range(8):
         if AMAZON_HOST_RE.match(host_of(cur)):
             return cur
@@ -156,13 +182,22 @@ async def resolve_final(session: aiohttp.ClientSession, url: str) -> Optional[st
             async with session.get(
                 cur, headers=HEADERS, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=15)
             ) as r:
+                status = r.status
                 loc = r.headers.get("Location")
-                if r.status in (301, 302, 303, 307, 308) and loc:
+                if status in (301, 302, 303, 307, 308) and loc:
                     cur = urljoin(cur, loc)
                     continue
+                if status == 200:
+                    body = (await r.content.read(300_000)).decode("utf-8", "ignore")
+                    nxt = _find_redirect(body, cur)
+                    if nxt and nxt != cur:
+                        cur = nxt
+                        continue
         except Exception as e:
             log.warning("resolve failed for %s: %s", url, e)
-        return None
+            return None
+        break
+    log.warning("could not resolve %s (last status %s, last url %s)", url, status, cur)
     return None
 
 
