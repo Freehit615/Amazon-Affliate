@@ -294,7 +294,8 @@ async def download_image(session, url: Optional[str]) -> Optional[io.BytesIO]:
 
 
 # ---------------------------------------------------------------- formatting
-def format_post(title: str, url: str, header: Optional[str], footer: Optional[str], limit: int = 1000) -> str:
+def format_post(title: str, url: str, header: Optional[str], footer: Optional[str], limit: int = 1000,
+                link_line: bool = True) -> str:
     """HTML post: [header] / 🛍️ bold title / [footer] / 👉 Check Price link."""
 
     def build(t: str) -> str:
@@ -304,7 +305,8 @@ def format_post(title: str, url: str, header: Optional[str], footer: Optional[st
         parts.append(f"🛍️ <b>{html.escape(t, quote=False)}</b>")
         if footer:
             parts.append(html.escape(footer, quote=False))
-        parts.append(f'👉 <a href="{html.escape(url, quote=True)}">Check Price</a>')
+        if link_line:
+            parts.append(f'👉 <a href="{html.escape(url, quote=True)}">Check Price</a>')
         return "\n\n".join(parts)
 
     text = build(title)
