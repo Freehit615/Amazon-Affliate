@@ -15,10 +15,11 @@ from typing import Optional
 import aiohttp
 from telethon import Button, TelegramClient, events, utils as tl_utils
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.channels import GetChannelsRequest, JoinChannelRequest
+from telethon.tl.functions.messages import GetChatsRequest
 from telethon.tl.functions.bots import SetBotCommandsRequest
-from telethon.tl.types import (BotCommand, BotCommandScopeDefault, Channel, Chat,
-                               InputPeerChannel, InputPeerChat)
+from telethon.tl.types import (BotCommand, BotCommandScopeDefault, Channel, ChannelForbidden, Chat,
+                               ChatForbidden, InputChannel, InputPeerChannel, InputPeerChat)
 
 import utils as U
 from database import Database
@@ -200,14 +201,64 @@ async def cmd_del_source(event, arg):
     )
 
 
+async def check_source(cid: int):
+    """Live check of a source. Returns (ok, reason). Never raises."""
+    try:
+        peer = await S.client.get_input_entity(cid)
+    except Exception:
+        return False, "Account ke paas yeh chat nahi hai (leave/removed/delete)"
+    try:
+        if isinstance(peer, InputPeerChannel):
+            res = await S.client(GetChannelsRequest([InputChannel(peer.channel_id, peer.access_hash)]))
+        elif isinstance(peer, InputPeerChat):
+            res = await S.client(GetChatsRequest([peer.chat_id]))
+        else:
+            return False, "Invalid chat type"
+    except Exception as e:  # ChannelPrivate / ChannelInvalid / ChatIdInvalid ...
+        name = type(e).__name__
+        if "Private" in name:
+            return False, "Delete ho gaya ya account banned/removed hai"
+        if "Invalid" in name:
+            return False, "Channel/group delete ho gaya"
+        return False, f"Check fail: {name}"
+    ent = res.chats[0] if res.chats else None
+    if ent is None or isinstance(ent, (ChannelForbidden, ChatForbidden)):
+        return False, "Delete ho gaya ya access nahi hai"
+    if getattr(ent, "deleted", False):
+        return False, "Group delete ho gaya"
+    if getattr(ent, "migrated_to", None):
+        return False, "Group supergroup mein migrate ho gaya (naya ID add karein)"
+    if getattr(ent, "left", False):
+        return False, "Account ne leave kar diya"
+    return True, ""
+
+
 async def cmd_status(event, arg):
     src = S.db.sources
-    lines = [f"📡 <b>Active Sources</b> ({len(src)})\n"]
-    if src:
-        for n, (cid, title) in enumerate(sorted(src.items(), key=lambda x: str(x[1]).lower()), 1):
-            lines.append(f"{n}. {esc(title)}\n    🆔 <code>{cid}</code>")
-    else:
+    items = sorted(src.items(), key=lambda x: str(x[1]).lower())
+    sem = asyncio.Semaphore(5)
+
+    async def run(cid):
+        async with sem:
+            return await check_source(cid)
+
+    results = await asyncio.gather(*(run(cid) for cid, _ in items)) if items else []
+    good = [(c, t) for (c, t), (ok, _) in zip(items, results) if ok]
+    bad = [(c, t, r) for (c, t), (ok, r) in zip(items, results) if not ok]
+
+    lines = [f"📡 <b>Active Sources</b> ({len(good)})\n"]
+    if good:
+        for n, (cid, title) in enumerate(good, 1):
+            lines.append(f"{n}. ✅ {esc(title)}\n    🆔 <code>{cid}</code>")
+    elif not src:
         lines.append("Abhi koi source add nahi hai. Channel ki ID bhejkar add karein.")
+    else:
+        lines.append("Koi working source nahi hai.")
+    if bad:
+        lines.append(f"\n⚠️ <b>Unavailable Sources</b> ({len(bad)})\n")
+        for n, (cid, title, why) in enumerate(bad, 1):
+            lines.append(f"{n}. ❌ {esc(title)}\n    🆔 <code>{cid}</code>\n    ⚠️ {esc(why)}")
+        lines.append("\nIn sources se posts nahi aayengi. Hatane ke liye <code>/del_source &lt;id&gt;</code>")
     lines.append("\n📢 <b>Destination Channel</b>\n")
     dest = S.dest or await refresh_dest()
     if dest:
